@@ -106,6 +106,7 @@ class Attention(nn.Module):
     def get_output_bias(self):
         return self.linear_o.bias
 
+
 class GlobalAttention(nn.Module):
     def __init__(self, input_dim, head_dim, num_heads, inf, eps):
         super(GlobalAttention, self).__init__()
@@ -190,6 +191,7 @@ class MSAAttention(nn.Module):
             self.linear_z = Linear(d_pair, num_heads, bias=False, init="normal")
 
         self.mha = Attention(d_in, d_in, d_in, d_hid, num_heads, use_flash_attn=use_flash_attn)
+        self.use_flash_attn = use_flash_attn
 
     @torch.jit.ignore
     def _chunk(
@@ -198,14 +200,30 @@ class MSAAttention(nn.Module):
         mask: Optional[torch.Tensor] = None,
         bias: Optional[torch.Tensor] = None,
         chunk_size: int = None,
+        q_cu_seqlens: torch.Tensor = None,
+        k_cu_seqlens: torch.Tensor = None,
     ) -> torch.Tensor:
 
-        return chunk_layer(
-            self._attn_forward,
-            {"m": m, "mask": mask, "bias": bias},
-            chunk_size=chunk_size,
-            num_batch_dims=len(m.shape[:-2]),
-        )
+        if q_cu_seqlens is None:
+            return chunk_layer(
+                self._attn_forward,
+                {
+                    "m": m, "mask": mask, "bias": bias,
+                },
+                chunk_size=chunk_size,
+                num_batch_dims=len(m.shape[:-2]),
+            )
+        else:
+            return chunk_layer(
+                self._attn_forward,
+                {
+                    "m": m, "mask": mask, "bias": bias,
+                    "q_cu_seqlens": q_cu_seqlens.unsqueeze(0).unsqueeze(0),
+                    "k_cu_seqlens": k_cu_seqlens.unsqueeze(0).unsqueeze(0),
+                },
+                chunk_size=chunk_size,
+                num_batch_dims=len(m.shape[:-2]),
+            )
 
     @torch.jit.ignore
     def _attn_chunk_forward(
@@ -230,9 +248,13 @@ class MSAAttention(nn.Module):
             )
         return torch.concat(outputs, dim=-3)
 
-    def _attn_forward(self, m, mask, bias: Optional[torch.Tensor] = None):
+    def _attn_forward(self, m, mask, bias: Optional[torch.Tensor] = None,
+                    q_cu_seqlens: Optional[torch.Tensor] = None,
+                    k_cu_seqlens: Optional[torch.Tensor] = None,):
         m = self.layer_norm_m(m)
-        return self.mha(q=m, k=m, v=m, mask=mask, bias=bias)
+        return self.mha(q=m, k=m, v=m, mask=mask, bias=bias,
+                q_cu_seqlens=q_cu_seqlens,
+                k_cu_seqlens=k_cu_seqlens)
 
     def forward(
         self,
@@ -252,7 +274,15 @@ class MSAAttention(nn.Module):
             )
 
         if chunk_size is not None:
-            m = self._chunk(m, attn_mask, bias, chunk_size)
+            if self.use_flash_attn:
+                batch_size = chunk_size
+                seq_n, _ = m.shape[-2:]
+                q_cu_seqlens = torch.arange(
+                    0, (batch_size + 1) * seq_n, step=seq_n, dtype=torch.int32, device=m.device
+                )
+                m = self._chunk(m, attn_mask, bias, chunk_size, q_cu_seqlens=q_cu_seqlens, k_cu_seqlens=q_cu_seqlens)
+            else:
+                m = self._chunk(m, attn_mask, bias, chunk_size)
         else:
             attn_chunk_size = 2560
             if m.shape[-3] <= attn_chunk_size:
@@ -277,7 +307,7 @@ class MSARowAttentionWithPairBias(MSAAttention):
             num_heads,
             pair_bias=True,
             d_pair=d_pair,
-            use_flash_attn=False
+            use_flash_attn=use_flash_attn
         )
 
 
@@ -382,6 +412,7 @@ class TriangleAttention(nn.Module):
         self.layer_norm = LayerNorm(d_in)
         self.linear = Linear(d_in, num_heads, bias=False, init="normal")
         self.mha = Attention(d_in, d_in, d_in, d_hid, num_heads, use_flash_attn=use_flash_attn)
+        self.use_flash_attn = use_flash_attn
 
     @torch.jit.ignore
     def _chunk(
@@ -390,13 +421,29 @@ class TriangleAttention(nn.Module):
         mask: Optional[torch.Tensor] = None,
         bias: Optional[torch.Tensor] = None,
         chunk_size: int = None,
+        q_cu_seqlens: torch.Tensor = None,
+        k_cu_seqlens: torch.Tensor = None,
     ) -> torch.Tensor:
-        return chunk_layer(
-            self.mha,
-            {"q": x, "k": x, "v": x, "mask": mask, "bias": bias},
-            chunk_size=chunk_size,
-            num_batch_dims=len(x.shape[:-2]),
-        )
+        if q_cu_seqlens is None:
+            return chunk_layer(
+                self.mha,
+                {
+                    "q": x, "k": x, "v": x, "mask": mask, "bias": bias,
+                },
+                chunk_size=chunk_size,
+                num_batch_dims=len(x.shape[:-2]),
+            )
+        else:
+            return chunk_layer(
+                self.mha,
+                {
+                    "q": x, "k": x, "v": x, "mask": mask, "bias": bias,
+                    "q_cu_seqlens": q_cu_seqlens.unsqueeze(0).unsqueeze(0),
+                    "k_cu_seqlens": k_cu_seqlens.unsqueeze(0).unsqueeze(0),
+                },
+                chunk_size=chunk_size,
+                num_batch_dims=len(x.shape[:-2]),
+            )
 
     def forward(
         self,
@@ -413,7 +460,15 @@ class TriangleAttention(nn.Module):
         )
 
         if chunk_size is not None:
-            x = self._chunk(x, attn_mask, triangle_bias, chunk_size)
+            if self.use_flash_attn:
+                batch_size = chunk_size
+                seq_n, _ = x.shape[-2:]
+                q_cu_seqlens = torch.arange(
+                    0, (batch_size + 1) * seq_n, step=seq_n, dtype=torch.int32, device=x.device
+                )
+                x = self._chunk(x, attn_mask, triangle_bias, chunk_size, q_cu_seqlens=q_cu_seqlens, k_cu_seqlens=q_cu_seqlens)
+            else:
+                x = self._chunk(x, attn_mask, triangle_bias, chunk_size)
         else:
             x = self.mha(q=x, k=x, v=x, mask=attn_mask, bias=triangle_bias)
 

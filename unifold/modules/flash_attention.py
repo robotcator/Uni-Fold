@@ -31,12 +31,19 @@ def _flash_attn(q, k, v, mask=None, bias=None, q_cu_seqlens=None, k_cu_seqlens=N
         q_cu_seqlens = torch.arange(
             0, (batch_size + 1) * n, step=n, dtype=torch.int32, device=q.device
         )
+    else:
+        # for chunk layer, the last chunk maybe not the multipler of chunk_size
+        q_cu_seqlens = q_cu_seqlens.flatten()
+        q_cu_seqlens = q_cu_seqlens[:batch_size+1]
 
     k_max_s = k_n
     if k_cu_seqlens is None:
         k_cu_seqlens = torch.arange(
             0, (k_batch_size + 1) * k_n, step=k_n, dtype=torch.int32, device=k.device
         )
+    else:
+        k_cu_seqlens = k_cu_seqlens.flatten()
+        k_cu_seqlens = k_cu_seqlens[:k_batch_size+1]
 
     if mask is not None:
         mask_heads, tgt_len, src_len = mask.shape[-3:]
